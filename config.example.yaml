@@ -1,0 +1,11 @@
+memory:
+  provider: graphiti
+
+plugins:
+  graphiti:
+    url: https://graphiti.example.com/mcp
+    group_id: xiaoyaner-core
+    timeout: 180
+    prefetch_mode: hybrid
+    sync_prefetch_timeout: 2.5
+    prefetch_limit: 6

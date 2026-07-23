@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-graphiti-memory"
+version = "0.1.0"
+description = "Standalone Graphiti MemoryProvider and unified recall plugin for Hermes Agent"
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.0", "PyYAML>=6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
