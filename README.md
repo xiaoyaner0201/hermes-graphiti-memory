@@ -3,7 +3,7 @@
 Standalone Hermes Agent memory provider for a Graphiti MCP server. It exposes two model tools:
 
 - `graphiti_memory`: direct Graphiti operations (`status`, `search_facts`, `search_nodes`, `get_episodes`, `add_episode`, failed-write spool/replay, and delete/get helpers).
-- `recall`: unified explicit recall across Graphiti facts/nodes and Hermes `session_search`, with `sources`, `depth`, `budget`, `provenance`, `role_filter`, `session_id`, `hermes_home`, and `dispatch=sequential|concurrent`.
+- `recall`: unified explicit recall across Graphiti facts/nodes and Hermes `session_search`, with `sources`, `depth`, `budget`, `provenance`, and `role_filter`. Session id and Hermes home are trusted runtime values injected by Hermes, not public tool arguments.
 
 The implementation is based on the production Graphiti provider behavior, but is packaged as an isolated repo. It does not copy secrets and defaults to no URL unless configured.
 
@@ -18,6 +18,13 @@ python -m pip install -e .
 mkdir -p "$HERMES_HOME/plugins"
 ln -s "$PWD" "$HERMES_HOME/plugins/graphiti"
 hermes config set memory.provider graphiti
+```
+
+The bundled `scripts/install.sh` creates the same symlink. If `$HERMES_HOME/plugins/graphiti` already exists as a real directory or regular file, the script refuses to replace it. Back up or migrate that existing plugin first, for example:
+
+```bash
+mv "$HERMES_HOME/plugins/graphiti" "$HERMES_HOME/plugins/graphiti.backup.$(date +%Y%m%d%H%M%S)"
+bash scripts/install.sh
 ```
 
 ## Configuration

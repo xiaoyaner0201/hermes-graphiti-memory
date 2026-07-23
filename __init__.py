@@ -33,6 +33,7 @@ _DEFAULT_PREFETCH_MODE = "hybrid"  # async | sync | hybrid
 _DEFAULT_SYNC_PREFETCH_TIMEOUT = 2.5
 _MAX_TURN_CHARS_DEFAULT = 8000
 _MAX_SESSION_CHARS_DEFAULT = 20000
+_GRAPH_TIMEOUT_BY_DEPTH = {"light": 6.0, "standard": 10.0, "deep": 15.0, "evidence": 20.0}
 
 
 def _load_config() -> dict:
@@ -150,9 +151,9 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._thread_id = ""
         self._turn_counter = 0
 
-        self._prefetch_cache: dict[str, str] = {}
+        self._prefetch_cache: dict[tuple[str, str], str] = {}
         self._prefetch_lock = threading.Lock()
-        self._inflight_prefetch: set[str] = set()
+        self._inflight_prefetch: set[tuple[str, str]] = set()
 
         self._write_queue: queue.Queue[dict | object] = queue.Queue()
         self._stop = object()
@@ -260,8 +261,9 @@ class GraphitiMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         query = (query or "").strip()
         sid = session_id or self._session_id or "default"
+        cache_key = (sid, query)
         with self._prefetch_lock:
-            cached = self._prefetch_cache.pop(sid, "")
+            cached = self._prefetch_cache.pop(cache_key, "")
         if cached:
             return cached
         if not query:
@@ -290,7 +292,7 @@ class GraphitiMemoryProvider(MemoryProvider):
         if not query:
             return
         sid = session_id or self._session_id or "default"
-        key = f"{sid}:{hash(query)}"
+        key = (sid, query)
         with self._prefetch_lock:
             if key in self._inflight_prefetch:
                 return
@@ -301,7 +303,7 @@ class GraphitiMemoryProvider(MemoryProvider):
                 ctx = self._build_recall_context(query)
                 if ctx:
                     with self._prefetch_lock:
-                        self._prefetch_cache[sid] = ctx
+                        self._prefetch_cache[key] = ctx
             except Exception as exc:
                 logger.debug("Graphiti prefetch failed: %s", exc)
             finally:
@@ -372,8 +374,8 @@ class GraphitiMemoryProvider(MemoryProvider):
                 "name": "recall",
                 "description": (
                     "Unified explicit recall across Graphiti facts/nodes and Hermes session history. "
-                    "Use when automatic prefetch is insufficient. Supports depth, sources, budget, provenance, role_filter, "
-                    "session_id/hermes_home-aware session_search, and sequential/concurrent dispatch."
+                    "Use when automatic prefetch is insufficient. Supports depth, sources, budget, provenance, "
+                    "and role_filter. Runtime-injected session/home context is trusted and cannot be overridden by tool arguments."
                 ),
                 "parameters": {
                     "type": "object",
@@ -386,9 +388,6 @@ class GraphitiMemoryProvider(MemoryProvider):
                         "provenance": {"type": "string", "enum": ["none", "ids", "links", "verbatim"], "default": "ids"},
                         "role_filter": {"type": "string", "description": "Optional session role filter, e.g. user,assistant."},
                         "limit": {"type": "integer", "description": "Max session results; clamped by budget and hard-capped at 5."},
-                        "dispatch": {"type": "string", "enum": ["sequential", "concurrent"], "default": "sequential"},
-                        "session_id": {"type": "string", "description": "Optional logical/current Hermes session id for lineage filtering."},
-                        "hermes_home": {"type": "string", "description": "Optional Hermes home for locating state.db when db is not injected."},
                     },
                     "required": ["query"],
                 },
@@ -508,19 +507,115 @@ class GraphitiMemoryProvider(MemoryProvider):
         raw = "|".join([query or "", mode or "", depth or "", ",".join(sorted(sources))])
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
-    def _graph_recall_for_tool(self, query: str, depth: str) -> tuple[str, Optional[str]]:
-        timeout_by_depth = {"light": 6.0, "standard": 10.0, "deep": 15.0, "evidence": 20.0}
-        try:
-            timeout = max(float(self._sync_prefetch_timeout or 0.0), timeout_by_depth.get(depth, 10.0))
-            return self._build_recall_context_with_timeout(query, timeout), None
-        except Exception as exc:
-            return "", f"graph recall failed: {exc}"
+    @staticmethod
+    def _collect_graph_provenance(facts: Any, nodes: Any, provenance: str) -> dict[str, Any]:
+        if provenance == "none":
+            return {}
+        fact_items = facts.get("facts") if isinstance(facts, dict) else []
+        node_items = nodes.get("nodes") if isinstance(nodes, dict) else []
+        if provenance == "verbatim":
+            return {"facts": fact_items or [], "nodes": node_items or []}
+        details: dict[str, list[str]] = {"facts": [], "nodes": []}
+        for item in fact_items or []:
+            if isinstance(item, dict):
+                ident = item.get("uuid") or item.get("id") or item.get("source") or item.get("fact")
+                if ident:
+                    details["facts"].append(str(ident))
+        for item in node_items or []:
+            if isinstance(item, dict):
+                ident = item.get("uuid") or item.get("id") or item.get("name")
+                if ident:
+                    details["nodes"].append(str(ident))
+        return details
 
-    def _session_db_from_kwargs(self, args: Dict[str, Any], kwargs: Dict[str, Any]) -> Any:
+    def _format_graph_recall(self, facts: Any, nodes: Any) -> str:
+        lines: list[str] = ["Graphiti recalled long-term memory:"]
+        fact_items = facts.get("facts") if isinstance(facts, dict) else None
+        if fact_items:
+            lines.append("Facts:")
+            for f in fact_items[: self._prefetch_limit]:
+                fact = f.get("fact") if isinstance(f, dict) else str(f)
+                valid_at = f.get("valid_at") if isinstance(f, dict) else None
+                lines.append(f"- {fact}" + (f" (valid_at: {valid_at})" if valid_at else ""))
+        node_items = nodes.get("nodes") if isinstance(nodes, dict) else None
+        if node_items:
+            lines.append("Nodes:")
+            for n in node_items[: self._prefetch_limit]:
+                if isinstance(n, dict):
+                    lines.append(f"- {n.get('name')}: {n.get('summary') or ''}")
+                else:
+                    lines.append(f"- {n}")
+        if len(lines) == 1:
+            return ""
+        return "\n".join(lines)
+
+    def _graph_recall_payload(self, query: str, *, include_nodes: bool, timeout: float) -> tuple[str, dict[str, Any]]:
+        query = (query or "").strip()
+        if not query:
+            return "", {"facts": {}, "nodes": {}}
+        effective_timeout = max(0.1, min(float(timeout), float(self._timeout)))
+
+        async def _run() -> list[Any]:
+            server_timeout = max(0.1, effective_timeout - 3.0)
+            specs = [
+                (
+                    "search_memory_facts",
+                    {
+                        "query": query,
+                        "group_ids": [self._group_id],
+                        "max_facts": self._prefetch_limit,
+                        "timeout_seconds": server_timeout,
+                    },
+                )
+            ]
+            if include_nodes:
+                specs.append(
+                    (
+                        "search_nodes",
+                        {
+                            "query": query,
+                            "group_ids": [self._group_id],
+                            "max_nodes": max(3, min(self._prefetch_limit, 8)),
+                            "timeout_seconds": server_timeout,
+                        },
+                    )
+                )
+            return list(await asyncio.wait_for(
+                asyncio.gather(*(self._call_tool(tool, args, timeout=effective_timeout) for tool, args in specs), return_exceptions=True),
+                timeout=effective_timeout,
+            ))
+
+        try:
+            outputs = asyncio.run(_run())
+        except TimeoutError:
+            logger.debug("Graphiti recall timed out after %.2fs", effective_timeout)
+            return "", {"facts": {}, "nodes": {}}
+        errors = [str(item) for item in outputs if isinstance(item, BaseException)]
+        facts = outputs[0] if outputs and not isinstance(outputs[0], BaseException) else {}
+        nodes = outputs[1] if include_nodes and len(outputs) > 1 and not isinstance(outputs[1], BaseException) else {}
+        return self._format_graph_recall(facts, nodes), {"facts": facts, "nodes": nodes, "errors": errors}
+
+    def recall_graph(self, query: str, *, include_nodes: bool = False, timeout: float | None = None) -> str:
+        """Run one bounded Graphiti facts/nodes recall for explicit recall callers."""
+        effective_timeout = max(float(timeout or self._sync_prefetch_timeout), float(self._sync_prefetch_timeout or 0.0))
+        text, _payload = self._graph_recall_payload(query, include_nodes=include_nodes, timeout=effective_timeout)
+        return text
+
+    def _graph_recall_for_tool(self, query: str, depth: str, provenance: str) -> tuple[str, dict[str, Any], Optional[str]]:
+        try:
+            timeout = max(float(self._sync_prefetch_timeout or 0.0), _GRAPH_TIMEOUT_BY_DEPTH.get(depth, 10.0))
+            text, payload = self._graph_recall_payload(query, include_nodes=depth in {"deep", "evidence"}, timeout=timeout)
+            errors = payload.get("errors") or []
+            err = f"graph recall failed: {'; '.join(errors)}" if errors and not text else None
+            return text, self._collect_graph_provenance(payload.get("facts"), payload.get("nodes"), provenance), err
+        except Exception as exc:
+            return "", {}, f"graph recall failed: {exc}"
+
+    def _session_db_from_kwargs(self, kwargs: Dict[str, Any]) -> Any:
         db = kwargs.get("db")
         if db is not None:
             return db
-        hermes_home = args.get("hermes_home") or kwargs.get("hermes_home") or self._hermes_home or os.environ.get("HERMES_HOME")
+        hermes_home = kwargs.get("hermes_home") or self._hermes_home or os.environ.get("HERMES_HOME")
         try:
             from hermes_state import SessionDB
             if hermes_home:
@@ -533,7 +628,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             return None
 
     def _session_recall_for_tool(self, query: str, args: Dict[str, Any], kwargs: Dict[str, Any], depth: str, budget: str) -> tuple[Any, Optional[str]]:
-        db = self._session_db_from_kwargs(args, kwargs)
+        db = self._session_db_from_kwargs(kwargs)
         if db is None:
             return None, "session source requested but session database is not available"
         try:
@@ -546,7 +641,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             role_filter = args.get("role_filter")
             if role_filter:
                 ss_kwargs["role_filter"] = role_filter
-            current_session_id = args.get("session_id") or kwargs.get("current_session_id") or self._session_id
+            current_session_id = kwargs.get("current_session_id") or self._session_id
             if current_session_id:
                 ss_kwargs["current_session_id"] = current_session_id
             raw = session_search(**ss_kwargs)
@@ -568,35 +663,23 @@ class GraphitiMemoryProvider(MemoryProvider):
         if not sources:
             sources = self._default_recall_sources(depth)
         provenance = args.get("provenance", "ids")
-        dispatch = (args.get("dispatch") or "sequential").strip().lower()
         results: Dict[str, Any] = {}
+        provenance_details: Dict[str, Any] = {}
         errors: List[str] = []
 
-        def run_graph() -> None:
-            text, err = self._graph_recall_for_tool(query, depth)
+        if "graph" in sources:
+            text, details, err = self._graph_recall_for_tool(query, depth, provenance)
             if err:
                 errors.append(err)
             results["graph"] = text or ""
-
-        def run_sessions() -> None:
+            if details:
+                provenance_details["graph"] = details
+        if any(s in sources for s in ("session_fts", "session_summary")):
             data, err = self._session_recall_for_tool(query, args, kwargs, depth, budget)
             if err:
                 errors.append(err)
             if data is not None:
                 results["sessions"] = data
-
-        jobs = []
-        if "graph" in sources:
-            jobs.append(run_graph)
-        if any(s in sources for s in ("session_fts", "session_summary")):
-            jobs.append(run_sessions)
-        if dispatch == "concurrent" and len(jobs) > 1:
-            threads = [threading.Thread(target=j, daemon=True) for j in jobs]
-            for t in threads: t.start()
-            for t in threads: t.join()
-        else:
-            for job in jobs:
-                job()
         payload = {
             "success": bool(results) and not (errors and not results),
             "query": query,
@@ -605,11 +688,12 @@ class GraphitiMemoryProvider(MemoryProvider):
             "sources": sources,
             "budget": budget,
             "provenance": provenance,
-            "dispatch": "concurrent" if dispatch == "concurrent" else "sequential",
             "recall_key": self._recall_key(query, mode=mode, depth=depth, sources=sources),
             "results": results,
             "errors": errors,
         }
+        if provenance_details:
+            payload["provenance_details"] = provenance_details
         return json.dumps(payload, ensure_ascii=False)
 
     def shutdown(self) -> None:
@@ -758,64 +842,20 @@ class GraphitiMemoryProvider(MemoryProvider):
         return True
 
     def _build_recall_context_with_timeout(self, query: str, timeout: float) -> str:
-        result_q: queue.Queue[tuple[bool, str]] = queue.Queue(maxsize=1)
-
-        def worker() -> None:
-            try:
-                result_q.put((True, self._build_recall_context(query)), block=False)
-            except Exception as exc:
-                logger.debug("Graphiti synchronous prefetch failed: %s", exc)
-                try:
-                    result_q.put((False, ""), block=False)
-                except queue.Full:
-                    pass
-
-        t = threading.Thread(target=worker, daemon=True, name="graphiti-sync-prefetch")
-        t.start()
-        try:
-            ok, ctx = result_q.get(timeout=timeout)
-            return ctx if ok else ""
-        except queue.Empty:
-            logger.debug("Graphiti synchronous prefetch timed out after %.2fs", timeout)
-            return ""
+        return self.recall_graph(query, include_nodes=False, timeout=timeout)
 
     def _build_recall_context(self, query: str) -> str:
-        facts = self._call_tool_sync("search_memory_facts", {
-            "query": query,
-            "group_ids": [self._group_id],
-            "max_facts": self._prefetch_limit,
-        })
-        nodes = self._call_tool_sync("search_nodes", {
-            "query": query,
-            "group_ids": [self._group_id],
-            "max_nodes": max(3, min(self._prefetch_limit, 8)),
-        })
-        lines: list[str] = ["Graphiti recalled long-term memory:"]
-        fact_items = facts.get("facts") if isinstance(facts, dict) else None
-        if fact_items:
-            lines.append("Facts:")
-            for f in fact_items[: self._prefetch_limit]:
-                fact = f.get("fact") if isinstance(f, dict) else str(f)
-                valid_at = f.get("valid_at") if isinstance(f, dict) else None
-                lines.append(f"- {fact}" + (f" (valid_at: {valid_at})" if valid_at else ""))
-        node_items = nodes.get("nodes") if isinstance(nodes, dict) else None
-        if node_items:
-            lines.append("Nodes:")
-            for n in node_items[: self._prefetch_limit]:
-                if isinstance(n, dict):
-                    lines.append(f"- {n.get('name')}: {n.get('summary') or ''}")
-        if len(lines) == 1:
-            return ""
-        return "\n".join(lines)
+        return self.recall_graph(query, include_nodes=False, timeout=self._sync_prefetch_timeout)
 
-    def _call_tool_sync(self, tool: str, args: dict) -> dict:
-        return asyncio.run(self._call_tool(tool, args))
+    def _call_tool_sync(self, tool: str, args: dict, *, timeout: float | None = None) -> dict:
+        return asyncio.run(self._call_tool(tool, args, timeout=timeout))
 
-    async def _call_tool(self, tool: str, args: dict) -> dict:
+    async def _call_tool(self, tool: str, args: dict, *, timeout: float | None = None) -> dict:
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
 
-        async with streamablehttp_client(self._url, headers=self._headers or None, timeout=self._timeout) as (read, write, _):
+        request_timeout = float(timeout or self._timeout)
+        async with streamablehttp_client(self._url, headers=self._headers or None, timeout=request_timeout) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool, args)

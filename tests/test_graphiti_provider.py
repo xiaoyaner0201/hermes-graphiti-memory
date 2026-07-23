@@ -1,10 +1,9 @@
 from __future__ import annotations
 import json
+import subprocess
 import sys
 import types
 from pathlib import Path
-
-import pytest
 
 from __init__ import GraphitiMemoryProvider, _ensure_mcp_url
 
@@ -21,9 +20,44 @@ def test_tool_schemas_expose_graphiti_memory_and_recall():
     assert {"graphiti_memory", "recall"}.issubset(schemas)
     recall_props = schemas["recall"]["parameters"]["properties"]
     assert "sources" in recall_props
-    assert "session_id" in recall_props
-    assert "hermes_home" in recall_props
-    assert "dispatch" in recall_props
+    assert "session_id" not in recall_props
+    assert "hermes_home" not in recall_props
+    assert "dispatch" not in recall_props
+
+
+def test_recall_ignores_untrusted_session_id_and_hermes_home_args(monkeypatch, tmp_path):
+    p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp", "retry_failed_on_start": False}}})
+    p._call_tool_sync = lambda tool, args: {"ok": True}
+    p.initialize("trusted-sid", platform="cli", hermes_home=str(tmp_path / "trusted"))
+    try:
+        opened = []
+        state_mod = types.ModuleType("hermes_state")
+
+        class FakeSessionDB:
+            def __init__(self, hermes_home=None):
+                opened.append(hermes_home)
+
+        setattr(state_mod, "SessionDB", FakeSessionDB)
+        sys.modules["hermes_state"] = state_mod
+        search_mod = types.ModuleType("tools.session_search_tool")
+
+        def fake_session_search(**kwargs):
+            assert kwargs["current_session_id"] == "trusted-sid"
+            return json.dumps({"success": True, "data": []})
+
+        setattr(search_mod, "session_search", fake_session_search)
+        sys.modules["tools.session_search_tool"] = search_mod
+
+        out = json.loads(p.handle_tool_call("recall", {
+            "query": "project",
+            "sources": ["session_fts"],
+            "session_id": "attacker-sid",
+            "hermes_home": str(tmp_path / "attacker"),
+        }))
+        assert out["success"] is True
+        assert opened == [str(tmp_path / "trusted")]
+    finally:
+        p.shutdown()
 
 
 def test_initialize_records_profile_scoped_hermes_home(tmp_path):
@@ -59,7 +93,7 @@ def test_graphiti_memory_search_facts_uses_group_and_limit():
 
 def test_recall_fuses_graph_and_session_search(monkeypatch):
     p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp", "group_id": "core"}}})
-    p._build_recall_context_with_timeout = lambda query, timeout: "Graphiti recalled long-term memory:\nFacts:\n- remembered"
+    p._graph_recall_for_tool = lambda query, depth, provenance: ("Graphiti recalled long-term memory:\nFacts:\n- remembered", {}, None)
 
     mod = types.ModuleType("tools.session_search_tool")
     def fake_session_search(**kwargs):
@@ -67,7 +101,7 @@ def test_recall_fuses_graph_and_session_search(monkeypatch):
         assert kwargs["limit"] == 2
         assert kwargs["current_session_id"] == "sid"
         return json.dumps({"success": True, "data": [{"session_id": "abc"}]})
-    mod.session_search = fake_session_search
+    setattr(mod, "session_search", fake_session_search)
     sys.modules["tools.session_search_tool"] = mod
 
     out = json.loads(p.handle_tool_call("recall", {
@@ -75,8 +109,7 @@ def test_recall_fuses_graph_and_session_search(monkeypatch):
         "sources": ["graph", "session_fts"],
         "budget": "small",
         "limit": 5,
-        "session_id": "sid",
-    }, db=object()))
+    }, db=object(), current_session_id="sid"))
     assert out["success"] is True
     assert out["sources"] == ["graph", "session_fts"]
     assert "remembered" in out["results"]["graph"]
@@ -84,16 +117,25 @@ def test_recall_fuses_graph_and_session_search(monkeypatch):
     assert len(out["recall_key"]) == 16
 
 
-def test_recall_concurrent_dispatch_runs_both_sources(monkeypatch):
+def test_recall_deep_graph_includes_facts_and_nodes(monkeypatch):
     p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp"}}})
-    seen = []
-    p._build_recall_context_with_timeout = lambda query, timeout: seen.append("graph") or "g"
-    mod = types.ModuleType("tools.session_search_tool")
-    mod.session_search = lambda **kwargs: seen.append("session") or json.dumps({"success": True})
-    sys.modules["tools.session_search_tool"] = mod
-    out = json.loads(p.handle_tool_call("recall", {"query": "q", "sources": ["graph", "session_summary"], "dispatch": "concurrent"}, db=object()))
-    assert out["dispatch"] == "concurrent"
-    assert sorted(seen) == ["graph", "session"]
+    calls = []
+
+    async def fake_call(tool, args, *, timeout=None):
+        calls.append((tool, args, timeout))
+        if tool == "search_memory_facts":
+            return {"facts": [{"uuid": "f1", "fact": "remembered fact", "valid_at": "2026-01-01"}]}
+        if tool == "search_nodes":
+            return {"nodes": [{"uuid": "n1", "name": "Node", "summary": "remembered node"}]}
+        return {}
+
+    p._call_tool = fake_call
+    out = json.loads(p.handle_tool_call("recall", {"query": "q", "depth": "deep", "sources": ["graph"], "provenance": "ids"}, db=object()))
+    assert out["success"] is True
+    assert "remembered fact" in out["results"]["graph"]
+    assert "remembered node" in out["results"]["graph"]
+    assert out["provenance_details"]["graph"] == {"facts": ["f1"], "nodes": ["n1"]}
+    assert {c[0] for c in calls} == {"search_memory_facts", "search_nodes"}
 
 
 def test_failed_write_spool_and_replay(tmp_path):
@@ -120,4 +162,33 @@ def test_queue_prefetch_does_not_guess_or_rewrite_query():
         time.sleep(0.01)
     assert captured == ["exact query"]
     with p._prefetch_lock:
-        assert p._prefetch_cache["s"] == "ctx"
+        assert p._prefetch_cache[("s", "exact query")] == "ctx"
+
+
+def test_prefetch_cache_is_exact_to_session_and_query():
+    p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp", "prefetch_mode": "async"}}})
+    with p._prefetch_lock:
+        p._prefetch_cache[("s", "old query")] = "old context"
+        p._prefetch_cache[("other", "new query")] = "other context"
+    queued = []
+    p.queue_prefetch = lambda query, *, session_id="": queued.append((session_id, query))
+    assert p.prefetch("new query", session_id="s") == ""
+    assert queued == [("s", "new query")]
+    assert p.prefetch("old query", session_id="s") == "old context"
+
+
+def test_install_refuses_existing_non_symlink_plugin_dir(tmp_path):
+    hermes_home = tmp_path / "hermes"
+    existing = hermes_home / "plugins" / "graphiti"
+    existing.mkdir(parents=True)
+    proc = subprocess.run(
+        ["bash", "scripts/install.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env={"HOME": str(tmp_path), "HERMES_HOME": str(hermes_home)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode == 1
+    assert "Refusing to replace existing non-symlink plugin path" in proc.stderr
+    assert existing.is_dir()
