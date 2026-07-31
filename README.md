@@ -7,13 +7,17 @@ Standalone Hermes Agent memory provider for a Graphiti MCP server. It exposes tw
 
 The implementation is based on the production Graphiti provider behavior, but is packaged as an isolated repo. It does not copy secrets and defaults to no URL unless configured.
 
+## Compatibility
+
+Version `0.1.x` targets the standalone memory-provider API in Hermes Agent v0.19.1 / v2026.7.30. The provider and `graphiti_memory` tool have been release-smoke-tested through an isolated Hermes gateway daemon against that release.
+
 ## Install
 
 ```bash
-# From this repo
-python -m pip install -e .
+# Install the standalone repository through Hermes
+hermes plugins install xiaoyaner0201/hermes-graphiti-memory
 
-# Or copy/symlink this directory as the active profile's user memory plugin
+# Or copy/symlink a checkout as the active profile's user memory plugin
 # Hermes discovers user-installed memory providers under $HERMES_HOME/plugins/<name>.
 mkdir -p "$HERMES_HOME/plugins"
 ln -s "$PWD" "$HERMES_HOME/plugins/graphiti"
