@@ -57,7 +57,9 @@ plugins:
     url: https://graphiti.example.com/mcp
     group_id: xiaoyaner-core
     timeout: 180
-    prefetch_mode: hybrid
+    # Graphiti search may take tens of seconds. Async prefetch keeps the user
+    # turn responsive and makes the warmed result available to the next turn.
+    prefetch_mode: async
     sync_prefetch_timeout: 2.5
     prefetch_limit: 6
     auto_sync_turns: true

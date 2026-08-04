@@ -114,6 +114,21 @@ def test_graphiti_memory_search_facts_uses_group_and_limit():
     assert calls == [("search_memory_facts", {"query": "q", "group_ids": ["core"], "max_facts": 2})]
 
 
+def test_graphiti_memory_get_episodes_translates_to_current_mcp_schema():
+    p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp", "group_id": "core"}}})
+    calls = []
+    p._call_tool_sync = lambda tool, args: calls.append((tool, args)) or {"episodes": []}
+
+    out = json.loads(p.handle_tool_call("graphiti_memory", {
+        "action": "get_episodes",
+        "group_id": "isolated",
+        "last_n": 7,
+    }))
+
+    assert out == {"episodes": []}
+    assert calls == [("get_episodes", {"group_ids": ["isolated"], "max_episodes": 7})]
+
+
 def test_recall_fuses_graph_and_session_search(monkeypatch):
     p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp", "group_id": "core"}}})
     p._graph_recall_for_tool = lambda query, depth, provenance: ("Graphiti recalled long-term memory:\nFacts:\n- remembered", {}, None)
@@ -159,6 +174,63 @@ def test_recall_deep_graph_includes_facts_and_nodes(monkeypatch):
     assert "remembered node" in out["results"]["graph"]
     assert out["provenance_details"]["graph"] == {"facts": ["f1"], "nodes": ["n1"]}
     assert {c[0] for c in calls} == {"search_memory_facts", "search_nodes"}
+
+
+def test_recall_surfaces_structured_mcp_error_instead_of_silent_empty_success():
+    p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp", "timeout": 90}}})
+
+    async def fake_call(tool, args, *, timeout=None):
+        return {"error": "Fact search timed out after 57.0s"}
+
+    p._call_tool = fake_call
+    out = json.loads(p.handle_tool_call("recall", {
+        "query": "project decision",
+        "depth": "standard",
+        "sources": ["graph"],
+    }, db=object()))
+
+    assert out["success"] is False
+    assert out["results"]["graph"] == ""
+    assert out["errors"] == ["graph recall failed: facts: Fact search timed out after 57.0s"]
+
+
+def test_standard_explicit_recall_allows_observed_graphiti_latency():
+    p = GraphitiMemoryProvider({"plugins": {"graphiti": {
+        "url": "http://g/mcp",
+        "timeout": 90,
+        "sync_prefetch_timeout": 2.5,
+    }}})
+    calls = []
+
+    async def fake_call(tool, args, *, timeout=None):
+        calls.append((tool, args, timeout))
+        return {"facts": [{"fact": "remembered"}]}
+
+    p._call_tool = fake_call
+    out = json.loads(p.handle_tool_call("recall", {
+        "query": "project decision",
+        "depth": "standard",
+        "sources": ["graph"],
+    }, db=object()))
+
+    assert out["success"] is True
+    assert calls[0][2] == 75.0
+    assert calls[0][1]["timeout_seconds"] == 72.0
+
+
+def test_background_prefetch_uses_full_provider_timeout():
+    p = GraphitiMemoryProvider({"plugins": {"graphiti": {
+        "url": "http://g/mcp",
+        "timeout": 90,
+        "sync_prefetch_timeout": 2.5,
+    }}})
+    calls = []
+    p.recall_graph = lambda query, *, include_nodes=False, timeout=None: calls.append(
+        (query, include_nodes, timeout)
+    ) or "context"
+
+    assert p._build_recall_context("project") == "context"
+    assert calls == [("project", False, 90.0)]
 
 
 def test_failed_write_spool_and_replay(tmp_path):
@@ -272,19 +344,20 @@ def test_queue_prefetch_does_not_guess_or_rewrite_query():
         time.sleep(0.01)
     assert captured == ["exact query"]
     with p._prefetch_lock:
-        assert p._prefetch_cache[("s", "exact query")] == "ctx"
+        assert p._prefetch_cache["s"] == ("exact query", "ctx")
 
 
-def test_prefetch_cache_is_exact_to_session_and_query():
+def test_prefetch_cache_is_session_scoped_and_consumed_by_next_turn():
     p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp", "prefetch_mode": "async"}}})
     with p._prefetch_lock:
-        p._prefetch_cache[("s", "old query")] = "old context"
-        p._prefetch_cache[("other", "new query")] = "other context"
+        p._prefetch_cache["s"] = ("old query", "old context")
+        p._prefetch_cache["other"] = ("other query", "other context")
     queued = []
     p.queue_prefetch = lambda query, *, session_id="": queued.append((session_id, query))
-    assert p.prefetch("new query", session_id="s") == ""
+    assert p.prefetch("new query", session_id="s") == "old context"
     assert queued == [("s", "new query")]
-    assert p.prefetch("old query", session_id="s") == "old context"
+    assert "s" not in p._prefetch_cache
+    assert p._prefetch_cache["other"] == ("other query", "other context")
 
 
 def test_install_refuses_existing_non_symlink_plugin_dir(tmp_path):
