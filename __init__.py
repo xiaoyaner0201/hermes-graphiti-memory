@@ -198,6 +198,7 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._prefetch_cache: dict[str, tuple[str, str]] = {}
         self._prefetch_lock = threading.Lock()
         self._inflight_prefetch: set[tuple[str, str]] = set()
+        self._prefetch_generation: dict[str, int] = {}
 
         self._write_queue: queue.Queue[dict | object] = queue.Queue()
         self._stop = object()
@@ -343,6 +344,11 @@ class GraphitiMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             if key in self._inflight_prefetch:
                 return
+            cached = self._prefetch_cache.get(sid)
+            if cached and cached[0] == query:
+                return
+            generation = self._prefetch_generation.get(sid, 0) + 1
+            self._prefetch_generation[sid] = generation
             self._inflight_prefetch.add(key)
 
         def worker():
@@ -350,7 +356,11 @@ class GraphitiMemoryProvider(MemoryProvider):
                 ctx = self._build_recall_context(query)
                 if ctx:
                     with self._prefetch_lock:
-                        self._prefetch_cache[sid] = (query, ctx)
+                        # A newer query for this session may have completed while
+                        # this worker was waiting on Graphiti. Never let the late
+                        # older result overwrite newer context.
+                        if self._prefetch_generation.get(sid) == generation:
+                            self._prefetch_cache[sid] = (query, ctx)
             except Exception as exc:
                 logger.debug("Graphiti prefetch failed: %s", exc)
             finally:
@@ -399,6 +409,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             with self._prefetch_lock:
                 self._prefetch_cache.clear()
                 self._inflight_prefetch.clear()
+                self._prefetch_generation.clear()
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         # Give the compressor a hint that the provider is already archiving turns.
@@ -714,7 +725,13 @@ class GraphitiMemoryProvider(MemoryProvider):
                 ss_kwargs["current_session_id"] = current_session_id
             raw = session_search(**ss_kwargs)
             try:
-                return json.loads(raw), None
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and parsed.get("success") is False:
+                    detail = parsed.get("error")
+                    if not detail and parsed.get("errors"):
+                        detail = "; ".join(str(item) for item in parsed["errors"])
+                    return parsed, f"session recall failed: {detail or 'unknown session search error'}"
+                return parsed, None
             except Exception:
                 return raw, None
         except Exception as exc:
@@ -944,7 +961,23 @@ class GraphitiMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _parse_mcp_result(result: Any) -> dict:
-        # MCP SDK returns CallToolResult with .content list of TextContent.
+        # MCP 2.x may return structuredContent/isError without text content.
+        # Prefer that lossless representation, while retaining the MCP 1.x text
+        # fallback below.
+        is_error = bool(
+            getattr(result, "isError", False)
+            or getattr(result, "is_error", False)
+        )
+        structured = getattr(result, "structuredContent", None)
+        if structured is None:
+            structured = getattr(result, "structured_content", None)
+        if structured is not None:
+            parsed = dict(structured) if isinstance(structured, dict) else {"result": structured}
+            if is_error and not parsed.get("error"):
+                parsed["error"] = str(parsed.get("message") or "MCP tool returned an error")
+            return parsed
+
+        # MCP 1.x returns CallToolResult with .content list of TextContent.
         text_parts: list[str] = []
         for item in getattr(result, "content", []) or []:
             txt = getattr(item, "text", None)
@@ -952,11 +985,18 @@ class GraphitiMemoryProvider(MemoryProvider):
                 text_parts.append(txt)
         text = "\n".join(text_parts).strip()
         if not text:
-            return {"result": None}
+            return {"error": "MCP tool returned an error"} if is_error else {"result": None}
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
+            if is_error:
+                if isinstance(parsed, dict):
+                    if not parsed.get("error"):
+                        parsed["error"] = str(parsed.get("message") or text)
+                    return parsed
+                return {"error": text, "result": parsed}
+            return parsed
         except Exception:
-            return {"text": text}
+            return {"error": text} if is_error else {"text": text}
 
 
 def register(ctx):

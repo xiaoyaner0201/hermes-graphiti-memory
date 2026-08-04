@@ -2,6 +2,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -153,6 +155,24 @@ def test_recall_fuses_graph_and_session_search(monkeypatch):
     assert "remembered" in out["results"]["graph"]
     assert out["results"]["sessions"]["success"] is True
     assert len(out["recall_key"]) == 16
+
+
+def test_recall_propagates_nested_session_failure(monkeypatch):
+    p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp"}}})
+    mod = types.ModuleType("tools.session_search_tool")
+    setattr(mod, "session_search", lambda **kwargs: json.dumps({
+        "success": False,
+        "error": "database unavailable",
+    }))
+    sys.modules["tools.session_search_tool"] = mod
+
+    out = json.loads(p.handle_tool_call("recall", {
+        "query": "project",
+        "sources": ["session_fts"],
+    }, db=object(), current_session_id="sid"))
+
+    assert out["success"] is False
+    assert out["errors"] == ["session recall failed: database unavailable"]
 
 
 def test_recall_deep_graph_includes_facts_and_nodes(monkeypatch):
@@ -347,6 +367,50 @@ def test_queue_prefetch_does_not_guess_or_rewrite_query():
         assert p._prefetch_cache["s"] == ("exact query", "ctx")
 
 
+def test_late_prefetch_cannot_overwrite_newer_session_context():
+    p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp"}}})
+    q1_started = threading.Event()
+    release_q1 = threading.Event()
+
+    def build(query):
+        if query == "q1":
+            q1_started.set()
+            assert release_q1.wait(2)
+            return "ctx1"
+        return "ctx2"
+
+    p._build_recall_context = build
+    p.queue_prefetch("q1", session_id="s")
+    assert q1_started.wait(1)
+    p.queue_prefetch("q2", session_id="s")
+    for _ in range(100):
+        with p._prefetch_lock:
+            if p._prefetch_cache.get("s") == ("q2", "ctx2"):
+                break
+        time.sleep(0.01)
+    release_q1.set()
+    for _ in range(100):
+        with p._prefetch_lock:
+            if not p._inflight_prefetch:
+                break
+        time.sleep(0.01)
+    with p._prefetch_lock:
+        assert p._prefetch_cache["s"] == ("q2", "ctx2")
+
+
+def test_queue_prefetch_skips_query_already_cached_for_session():
+    p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp"}}})
+    p._prefetch_cache["s"] = ("same query", "ctx")
+    called = []
+    p._build_recall_context = lambda query: called.append(query) or "duplicate"
+
+    p.queue_prefetch("same query", session_id="s")
+    time.sleep(0.05)
+
+    assert called == []
+    assert p._prefetch_cache["s"] == ("same query", "ctx")
+
+
 def test_prefetch_cache_is_session_scoped_and_consumed_by_next_turn():
     p = GraphitiMemoryProvider({"plugins": {"graphiti": {"url": "http://g/mcp", "prefetch_mode": "async"}}})
     with p._prefetch_lock:
@@ -358,6 +422,24 @@ def test_prefetch_cache_is_session_scoped_and_consumed_by_next_turn():
     assert queued == [("s", "new query")]
     assert "s" not in p._prefetch_cache
     assert p._prefetch_cache["other"] == ("other query", "other context")
+
+
+def test_parse_mcp2_structured_error_preserves_failure():
+    result = types.SimpleNamespace(
+        content=[],
+        structuredContent={"error": "backend timeout"},
+        isError=True,
+    )
+    assert GraphitiMemoryProvider._parse_mcp_result(result) == {"error": "backend timeout"}
+
+
+def test_parse_mcp2_structured_content_precedes_text_fallback():
+    result = types.SimpleNamespace(
+        content=[types.SimpleNamespace(text='{"facts": [{"fact": "old"}]}')],
+        structuredContent={"facts": [{"fact": "new"}]},
+        isError=False,
+    )
+    assert GraphitiMemoryProvider._parse_mcp_result(result) == {"facts": [{"fact": "new"}]}
 
 
 def test_install_refuses_existing_non_symlink_plugin_dir(tmp_path):
