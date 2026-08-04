@@ -58,7 +58,8 @@ plugins:
     group_id: xiaoyaner-core
     timeout: 180
     # Graphiti search may take tens of seconds. Async prefetch keeps the user
-    # turn responsive and makes the warmed result available to the next turn.
+    # turn responsive and makes a completed result eligible for a later turn.
+    # It does not guarantee completion by the immediately following turn.
     prefetch_mode: async
     sync_prefetch_timeout: 2.5
     prefetch_limit: 6
@@ -80,6 +81,21 @@ Environment overrides:
 - `GRAPHITI_GROUP_ID`
 
 Secrets belong in `.env`; do not commit tokens or copied production config.
+
+### Async prefetch semantics
+
+The async prefetch cache is a one-turn session pipeline, not a query-keyed
+lookup cache. A turn queues its Graphiti query without waiting. A later turn
+can consume the result only if the worker has already finished; otherwise no
+Graphiti context is injected. Explicit `recall` calls perform their own
+request and do not use this pipeline as a cache hit. Generation fencing keeps
+a late older worker from overwriting a newer result, and duplicate in-flight
+queries are suppressed.
+
+Because the warmed query may differ from the next user message, deployments
+should treat this context as background rather than proof that the current
+query was recalled. Query-keyed or semantic-match reuse is not implemented in
+version `0.1.5`.
 
 ## Verification
 
