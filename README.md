@@ -9,7 +9,23 @@ The implementation is based on the production Graphiti provider behavior, but is
 
 ## Compatibility
 
-Version `0.1.x` targets the standalone memory-provider API in Hermes Agent v0.19.1 / v2026.7.30. The provider and `graphiti_memory` tool have been release-smoke-tested through an isolated Hermes gateway daemon against that release.
+Version `0.1.x` supports the standalone memory-provider API in Hermes Agent
+v0.20 / `v2026.8.3` (validated against the reviewed local-capability tree
+`6eb7b0979ccc002c7adb4e9952ef6e1dd8da15ab`).
+
+Hermes v0.20 has three distinct compatibility/health signals:
+
+1. **Plugin registry:** Graphiti is an `exclusive` provider plugin, so a registry
+   listing may correctly show `runtime_enabled=false`. This means the generic
+   plugin runtime will not also run its hooks; it does **not** mean that the
+   selected memory provider is inactive.
+2. **Memory-provider activation:** `memory.provider: graphiti` is the setting
+   that selects and initializes Graphiti for Hermes memory lifecycle calls.
+   Provider discovery/availability is the relevant activation check.
+3. **Backend end-to-end:** only a successful real MCP `get_status` plus a
+   read-only search proves that Hermes can reach the configured Graphiti/Neo4j
+   backend. Registry discovery or provider construction alone is not backend
+   E2E proof.
 
 ## Install
 
@@ -44,7 +60,17 @@ plugins:
     prefetch_mode: hybrid
     sync_prefetch_timeout: 2.5
     prefetch_limit: 6
+    auto_sync_turns: true
+    session_end_episode: true
+    retry_failed_on_start: true
+    max_failed_replay_per_start: 20
 ```
+
+The four lifecycle settings above enable normal runtime writes and bounded
+startup replay. Set the write features deliberately for each deployment. The
+read-only smoke overrides all four in memory (`auto_sync_turns=false`,
+`session_end_episode=false`, `retry_failed_on_start=false`, replay limit `0`)
+without changing `config.yaml`.
 
 Environment overrides:
 
@@ -67,4 +93,7 @@ Optional read-only smoke against a configured production Graphiti MCP server:
 GRAPHITI_MCP_URL=... python scripts/readonly_smoke.py
 ```
 
-`readonly_smoke.py` only calls status/search operations and does not add test memories.
+`readonly_smoke.py` only calls MCP `get_status` and `search_memory_facts`. It
+does not call provider `initialize()`, `shutdown()`, sync/session-end hooks,
+replay, queue, spool, or any mutation tool. In particular, it cannot replay
+pending failed writes and does not alter the failed-write spool.

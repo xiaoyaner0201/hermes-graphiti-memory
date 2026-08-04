@@ -6,6 +6,7 @@ import types
 from pathlib import Path
 
 from __init__ import GraphitiMemoryProvider, _ensure_mcp_url
+from scripts import readonly_smoke
 
 
 def test_ensure_mcp_url_canonicalizes_trailing_slash():
@@ -147,6 +148,93 @@ def test_failed_write_spool_and_replay(tmp_path):
     replay = p._replay_failed_writes()
     assert replay["succeeded"] == 1
     assert p._list_failed_writes()["count"] == 0
+
+
+def test_readonly_smoke_provider_disables_all_automatic_write_paths(tmp_path):
+    p = readonly_smoke.create_readonly_provider({
+        "plugins": {
+            "graphiti": {
+                "url": "http://g/mcp",
+                "failed_write_dir": str(tmp_path),
+                "auto_sync_turns": True,
+                "session_end_episode": True,
+                "retry_failed_on_start": True,
+                "max_failed_replay_per_start": 20,
+            }
+        }
+    })
+
+    assert p._auto_sync is False
+    assert p._session_end_enabled is False
+    assert p._retry_failed_on_start is False
+    assert p._max_failed_replay_per_start == 0
+
+
+def test_readonly_smoke_preserves_legacy_memory_graphiti_connection_config():
+    p = readonly_smoke.create_readonly_provider({
+        "memory": {
+            "graphiti": {
+                "url": "http://legacy/mcp",
+                "group_id": "legacy-core",
+                "headers": {"Authorization": "redacted-test-value"},
+            }
+        }
+    })
+
+    assert p._url == "http://legacy/mcp"
+    assert p._group_id == "legacy-core"
+    assert p._headers == {"Authorization": "redacted-test-value"}
+    assert p._retry_failed_on_start is False
+
+
+def test_readonly_smoke_never_initializes_replays_writes_or_changes_spool(tmp_path):
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    pending = spool / "pending.json"
+    pending.write_bytes(b'{"pending": true}\n')
+    before = {path.relative_to(spool): path.read_bytes() for path in spool.rglob("*") if path.is_file()}
+
+    p = readonly_smoke.create_readonly_provider({
+        "plugins": {
+            "graphiti": {
+                "url": "http://g/mcp",
+                "group_id": "core",
+                "failed_write_dir": str(spool),
+            }
+        }
+    })
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("read-only smoke invoked a lifecycle, replay, sync, or write path")
+
+    p.initialize = forbidden
+    p.shutdown = forbidden
+    p._replay_failed_writes = forbidden
+    p.sync_turn = forbidden
+    p.on_session_end = forbidden
+    p._enqueue_add_memory = forbidden
+    p._spool_failed_write = forbidden
+
+    def read_call(tool, args):
+        calls.append((tool, args))
+        if tool == "get_status":
+            return {"status": "ok"}
+        if tool == "search_memory_facts":
+            return {"facts": [{"fact": "found"}]}
+        raise AssertionError(f"unexpected MCP tool: {tool}")
+
+    p._call_tool_sync = read_call
+    result = readonly_smoke.run_readonly_smoke(p, query="Hermes Graphiti")
+    after = {path.relative_to(spool): path.read_bytes() for path in spool.rglob("*") if path.is_file()}
+
+    assert result["status_success"] is True
+    assert result["facts_count"] == 1
+    assert calls == [
+        ("get_status", {}),
+        ("search_memory_facts", {"query": "Hermes Graphiti", "group_ids": ["core"], "max_facts": 1}),
+    ]
+    assert after == before
 
 
 def test_queue_prefetch_does_not_guess_or_rewrite_query():
