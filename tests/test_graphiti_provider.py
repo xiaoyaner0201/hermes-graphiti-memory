@@ -5,7 +5,7 @@ import sys
 import types
 from pathlib import Path
 
-from __init__ import GraphitiMemoryProvider, _ensure_mcp_url
+from __init__ import GraphitiMemoryProvider, _ensure_mcp_url, _streamable_http_client_factory
 from scripts import readonly_smoke
 
 
@@ -13,6 +13,28 @@ def test_ensure_mcp_url_canonicalizes_trailing_slash():
     assert _ensure_mcp_url("https://example.com") == "https://example.com/mcp"
     assert _ensure_mcp_url("https://example.com/mcp/") == "https://example.com/mcp"
     assert _ensure_mcp_url("") == ""
+
+
+def test_installed_mcp_streamable_http_client_symbol_is_supported():
+    factory, requires_http_client = _streamable_http_client_factory()
+    assert callable(factory)
+    assert isinstance(requires_http_client, bool)
+
+
+def test_readonly_smoke_main_fails_when_status_probe_fails(monkeypatch, capsys):
+    class Provider:
+        def is_available(self):
+            return True
+
+    monkeypatch.setattr(readonly_smoke, "create_readonly_provider", Provider)
+    monkeypatch.setattr(
+        readonly_smoke,
+        "run_readonly_smoke",
+        lambda provider: {"status_success": False, "status_keys": ["error"], "facts_count": 0},
+    )
+
+    assert readonly_smoke.main() == 1
+    assert '"status_success": false' in capsys.readouterr().out
 
 
 def test_tool_schemas_expose_graphiti_memory_and_recall():

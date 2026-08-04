@@ -76,8 +76,9 @@ def main() -> int:
             "provider unavailable: configure GRAPHITI_MCP_URL or "
             "plugins.graphiti.url and install mcp SDK"
         )
-    print(json.dumps(run_readonly_smoke(provider), ensure_ascii=False))
-    return 0
+    result = run_readonly_smoke(provider)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["status_success"] else 1
 
 
 if __name__ == "__main__":

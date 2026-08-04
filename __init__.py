@@ -9,7 +9,9 @@ Hermes immediately.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -25,6 +27,45 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+
+def _streamable_http_client_factory() -> tuple[Any, bool]:
+    """Return the MCP Streamable HTTP client across SDK 1.x and 2.x.
+
+    MCP 2.0 renamed ``streamablehttp_client`` to
+    ``streamable_http_client``.  Keep both spellings so the plugin's
+    declared ``mcp>=1.0`` dependency remains truthful.
+    """
+    try:
+        from mcp.client.streamable_http import streamablehttp_client
+
+        return streamablehttp_client, False
+    except ImportError:
+        from mcp.client.streamable_http import streamable_http_client
+
+        return streamable_http_client, True
+
+
+@asynccontextmanager
+async def _streamable_http_connection(
+    url: str,
+    *,
+    headers: dict[str, str] | None,
+    timeout: float,
+):
+    """Open an MCP Streamable HTTP transport on SDK 1.x or 2.x."""
+    client_factory, requires_http_client = _streamable_http_client_factory()
+    if not requires_http_client:
+        async with client_factory(url, headers=headers, timeout=timeout) as streams:
+            yield streams
+        return
+
+    httpx2 = importlib.import_module("httpx2")
+
+    async with httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client:
+        async with client_factory(url, http_client=http_client) as streams:
+            read, write = streams
+            yield read, write, None
 
 _DEFAULT_GROUP_ID = "xiaoyaner-core"
 _DEFAULT_TIMEOUT = 180
@@ -168,7 +209,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             return False
         try:
             import mcp  # noqa: F401
-            from mcp.client.streamable_http import streamablehttp_client  # noqa: F401
+            _streamable_http_client_factory()
             return True
         except Exception as exc:
             logger.warning("Graphiti memory provider unavailable: MCP SDK missing or old: %s", exc)
@@ -852,10 +893,13 @@ class GraphitiMemoryProvider(MemoryProvider):
 
     async def _call_tool(self, tool: str, args: dict, *, timeout: float | None = None) -> dict:
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client
 
         request_timeout = float(timeout or self._timeout)
-        async with streamablehttp_client(self._url, headers=self._headers or None, timeout=request_timeout) as (read, write, _):
+        async with _streamable_http_connection(
+            self._url,
+            headers=self._headers or None,
+            timeout=request_timeout,
+        ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool, args)
