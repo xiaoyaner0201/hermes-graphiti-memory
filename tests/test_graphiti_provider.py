@@ -217,7 +217,7 @@ def test_recall_surfaces_structured_mcp_error_instead_of_silent_empty_success():
 def test_standard_explicit_recall_allows_observed_graphiti_latency():
     p = GraphitiMemoryProvider({"plugins": {"graphiti": {
         "url": "http://g/mcp",
-        "timeout": 90,
+        "timeout": 120,
         "sync_prefetch_timeout": 2.5,
     }}})
     calls = []
@@ -234,8 +234,8 @@ def test_standard_explicit_recall_allows_observed_graphiti_latency():
     }, db=object()))
 
     assert out["success"] is True
-    assert calls[0][2] == 75.0
-    assert calls[0][1]["timeout_seconds"] == 72.0
+    assert calls[0][2] == 120.0
+    assert calls[0][1]["timeout_seconds"] == 117.0
 
 
 def test_background_prefetch_uses_full_provider_timeout():

@@ -74,7 +74,7 @@ _DEFAULT_PREFETCH_MODE = "async"  # async | sync | hybrid
 _DEFAULT_SYNC_PREFETCH_TIMEOUT = 2.5
 _MAX_TURN_CHARS_DEFAULT = 8000
 _MAX_SESSION_CHARS_DEFAULT = 20000
-_GRAPH_TIMEOUT_BY_DEPTH = {"light": 15.0, "standard": 75.0, "deep": 90.0, "evidence": 90.0}
+_GRAPH_TIMEOUT_BY_DEPTH = {"light": 15.0, "standard": 120.0, "deep": 120.0, "evidence": 120.0}
 
 
 def _load_config() -> dict:
