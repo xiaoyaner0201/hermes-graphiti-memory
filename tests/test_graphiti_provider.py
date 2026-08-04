@@ -442,6 +442,18 @@ def test_parse_mcp2_structured_content_precedes_text_fallback():
     assert GraphitiMemoryProvider._parse_mcp_result(result) == {"facts": [{"fact": "new"}]}
 
 
+def test_parse_mcp2_unwraps_single_result_envelope():
+    result = types.SimpleNamespace(
+        content=[],
+        structuredContent={"result": {"message": "ok", "facts": [{"fact": "new"}]}},
+        isError=False,
+    )
+    assert GraphitiMemoryProvider._parse_mcp_result(result) == {
+        "message": "ok",
+        "facts": [{"fact": "new"}],
+    }
+
+
 def test_install_refuses_existing_non_symlink_plugin_dir(tmp_path):
     hermes_home = tmp_path / "hermes"
     existing = hermes_home / "plugins" / "graphiti"

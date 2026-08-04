@@ -973,6 +973,10 @@ class GraphitiMemoryProvider(MemoryProvider):
             structured = getattr(result, "structured_content", None)
         if structured is not None:
             parsed = dict(structured) if isinstance(structured, dict) else {"result": structured}
+            # MCP 2 servers generated from a single object output schema may
+            # wrap the actual payload in a sole `result` field.
+            if set(parsed) == {"result"} and isinstance(parsed["result"], dict):
+                parsed = dict(parsed["result"])
             if is_error and not parsed.get("error"):
                 parsed["error"] = str(parsed.get("message") or "MCP tool returned an error")
             return parsed
