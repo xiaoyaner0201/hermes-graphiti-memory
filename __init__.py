@@ -9,7 +9,9 @@ Hermes immediately.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -26,14 +28,53 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+
+def _streamable_http_client_factory() -> tuple[Any, bool]:
+    """Return the MCP Streamable HTTP client across SDK 1.x and 2.x.
+
+    MCP 2.0 renamed ``streamablehttp_client`` to
+    ``streamable_http_client``.  Keep both spellings so the plugin's
+    declared ``mcp>=1.0`` dependency remains truthful.
+    """
+    try:
+        from mcp.client.streamable_http import streamablehttp_client
+
+        return streamablehttp_client, False
+    except ImportError:
+        from mcp.client.streamable_http import streamable_http_client
+
+        return streamable_http_client, True
+
+
+@asynccontextmanager
+async def _streamable_http_connection(
+    url: str,
+    *,
+    headers: dict[str, str] | None,
+    timeout: float,
+):
+    """Open an MCP Streamable HTTP transport on SDK 1.x or 2.x."""
+    client_factory, requires_http_client = _streamable_http_client_factory()
+    if not requires_http_client:
+        async with client_factory(url, headers=headers, timeout=timeout) as streams:
+            yield streams
+        return
+
+    httpx2 = importlib.import_module("httpx2")
+
+    async with httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client:
+        async with client_factory(url, http_client=http_client) as streams:
+            read, write = streams
+            yield read, write, None
+
 _DEFAULT_GROUP_ID = "xiaoyaner-core"
 _DEFAULT_TIMEOUT = 180
 _DEFAULT_PREFETCH_LIMIT = 6
-_DEFAULT_PREFETCH_MODE = "hybrid"  # async | sync | hybrid
+_DEFAULT_PREFETCH_MODE = "async"  # async | sync | hybrid
 _DEFAULT_SYNC_PREFETCH_TIMEOUT = 2.5
 _MAX_TURN_CHARS_DEFAULT = 8000
 _MAX_SESSION_CHARS_DEFAULT = 20000
-_GRAPH_TIMEOUT_BY_DEPTH = {"light": 6.0, "standard": 10.0, "deep": 15.0, "evidence": 20.0}
+_GRAPH_TIMEOUT_BY_DEPTH = {"light": 15.0, "standard": 120.0, "deep": 120.0, "evidence": 120.0}
 
 
 def _load_config() -> dict:
@@ -151,9 +192,13 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._thread_id = ""
         self._turn_counter = 0
 
-        self._prefetch_cache: dict[tuple[str, str], str] = {}
+        # queue_prefetch() runs after a completed turn and its result is consumed
+        # by the *next* turn.  Cache by session, not by exact query text: the next
+        # user message is expected to differ even when it continues the topic.
+        self._prefetch_cache: dict[str, tuple[str, str]] = {}
         self._prefetch_lock = threading.Lock()
         self._inflight_prefetch: set[tuple[str, str]] = set()
+        self._prefetch_generation: dict[str, int] = {}
 
         self._write_queue: queue.Queue[dict | object] = queue.Queue()
         self._stop = object()
@@ -168,7 +213,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             return False
         try:
             import mcp  # noqa: F401
-            from mcp.client.streamable_http import streamablehttp_client  # noqa: F401
+            _streamable_http_client_factory()
             return True
         except Exception as exc:
             logger.warning("Graphiti memory provider unavailable: MCP SDK missing or old: %s", exc)
@@ -261,11 +306,14 @@ class GraphitiMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         query = (query or "").strip()
         sid = session_id or self._session_id or "default"
-        cache_key = (sid, query)
         with self._prefetch_lock:
-            cached = self._prefetch_cache.pop(cache_key, "")
+            cached = self._prefetch_cache.pop(sid, None)
         if cached:
-            return cached
+            _warmed_query, context = cached
+            # Keep the one-turn pipeline moving: return the previous turn's
+            # warmed context now while warming the current query for next turn.
+            self.queue_prefetch(query, session_id=sid)
+            return context
         if not query:
             return ""
 
@@ -296,6 +344,11 @@ class GraphitiMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             if key in self._inflight_prefetch:
                 return
+            cached = self._prefetch_cache.get(sid)
+            if cached and cached[0] == query:
+                return
+            generation = self._prefetch_generation.get(sid, 0) + 1
+            self._prefetch_generation[sid] = generation
             self._inflight_prefetch.add(key)
 
         def worker():
@@ -303,7 +356,11 @@ class GraphitiMemoryProvider(MemoryProvider):
                 ctx = self._build_recall_context(query)
                 if ctx:
                     with self._prefetch_lock:
-                        self._prefetch_cache[key] = ctx
+                        # A newer query for this session may have completed while
+                        # this worker was waiting on Graphiti. Never let the late
+                        # older result overwrite newer context.
+                        if self._prefetch_generation.get(sid) == generation:
+                            self._prefetch_cache[sid] = (query, ctx)
             except Exception as exc:
                 logger.debug("Graphiti prefetch failed: %s", exc)
             finally:
@@ -352,6 +409,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             with self._prefetch_lock:
                 self._prefetch_cache.clear()
                 self._inflight_prefetch.clear()
+                self._prefetch_generation.clear()
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         # Give the compressor a hint that the provider is already archiving turns.
@@ -437,7 +495,10 @@ class GraphitiMemoryProvider(MemoryProvider):
                     "query": args.get("query", ""), "group_ids": [gid], "max_nodes": int(args.get("max_nodes") or self._prefetch_limit),
                 }), ensure_ascii=False)
             if action == "get_episodes":
-                return json.dumps(self._call_tool_sync("get_episodes", {"group_id": gid, "last_n": int(args.get("last_n") or 10)}), ensure_ascii=False)
+                return json.dumps(self._call_tool_sync("get_episodes", {
+                    "group_ids": [gid],
+                    "max_episodes": int(args.get("last_n") or 10),
+                }), ensure_ascii=False)
             if action == "add_episode":
                 return json.dumps(self._call_tool_sync("add_memory", {
                     "name": args.get("name") or f"Hermes manual episode {datetime.now(timezone.utc).isoformat()}",
@@ -589,10 +650,28 @@ class GraphitiMemoryProvider(MemoryProvider):
             outputs = asyncio.run(_run())
         except TimeoutError:
             logger.debug("Graphiti recall timed out after %.2fs", effective_timeout)
-            return "", {"facts": {}, "nodes": {}}
-        errors = [str(item) for item in outputs if isinstance(item, BaseException)]
-        facts = outputs[0] if outputs and not isinstance(outputs[0], BaseException) else {}
-        nodes = outputs[1] if include_nodes and len(outputs) > 1 and not isinstance(outputs[1], BaseException) else {}
+            return "", {
+                "facts": {},
+                "nodes": {},
+                "errors": [f"graph search timed out after {effective_timeout:.1f}s"],
+            }
+
+        labels = ["facts", "nodes"] if include_nodes else ["facts"]
+        errors: list[str] = []
+        normalized: list[dict[str, Any]] = []
+        for label, item in zip(labels, outputs):
+            if isinstance(item, BaseException):
+                errors.append(f"{label}: {item}")
+                normalized.append({})
+                continue
+            if isinstance(item, dict) and item.get("error"):
+                errors.append(f"{label}: {item['error']}")
+                normalized.append({})
+                continue
+            normalized.append(item if isinstance(item, dict) else {})
+
+        facts = normalized[0] if normalized else {}
+        nodes = normalized[1] if include_nodes and len(normalized) > 1 else {}
         return self._format_graph_recall(facts, nodes), {"facts": facts, "nodes": nodes, "errors": errors}
 
     def recall_graph(self, query: str, *, include_nodes: bool = False, timeout: float | None = None) -> str:
@@ -606,7 +685,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             timeout = max(float(self._sync_prefetch_timeout or 0.0), _GRAPH_TIMEOUT_BY_DEPTH.get(depth, 10.0))
             text, payload = self._graph_recall_payload(query, include_nodes=depth in {"deep", "evidence"}, timeout=timeout)
             errors = payload.get("errors") or []
-            err = f"graph recall failed: {'; '.join(errors)}" if errors and not text else None
+            err = f"graph recall failed: {'; '.join(errors)}" if errors else None
             return text, self._collect_graph_provenance(payload.get("facts"), payload.get("nodes"), provenance), err
         except Exception as exc:
             return "", {}, f"graph recall failed: {exc}"
@@ -646,7 +725,13 @@ class GraphitiMemoryProvider(MemoryProvider):
                 ss_kwargs["current_session_id"] = current_session_id
             raw = session_search(**ss_kwargs)
             try:
-                return json.loads(raw), None
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and parsed.get("success") is False:
+                    detail = parsed.get("error")
+                    if not detail and parsed.get("errors"):
+                        detail = "; ".join(str(item) for item in parsed["errors"])
+                    return parsed, f"session recall failed: {detail or 'unknown session search error'}"
+                return parsed, None
             except Exception:
                 return raw, None
         except Exception as exc:
@@ -680,8 +765,16 @@ class GraphitiMemoryProvider(MemoryProvider):
                 errors.append(err)
             if data is not None:
                 results["sessions"] = data
+        has_usable_result = bool(results.get("graph"))
+        if "sessions" in results:
+            session_result = results["sessions"]
+            has_usable_result = has_usable_result or not (
+                isinstance(session_result, dict) and session_result.get("success") is False
+            )
         payload = {
-            "success": bool(results) and not (errors and not results),
+            # A valid empty search is successful. A failed source with no usable
+            # sibling result is not; never disguise MCP timeouts as empty recall.
+            "success": not errors or has_usable_result,
             "query": query,
             "mode": mode,
             "depth": depth,
@@ -845,17 +938,22 @@ class GraphitiMemoryProvider(MemoryProvider):
         return self.recall_graph(query, include_nodes=False, timeout=timeout)
 
     def _build_recall_context(self, query: str) -> str:
-        return self.recall_graph(query, include_nodes=False, timeout=self._sync_prefetch_timeout)
+        # This runs in queue_prefetch()'s daemon worker after the turn, so it may
+        # use the full provider timeout without adding latency to the user reply.
+        return self.recall_graph(query, include_nodes=False, timeout=float(self._timeout))
 
     def _call_tool_sync(self, tool: str, args: dict, *, timeout: float | None = None) -> dict:
         return asyncio.run(self._call_tool(tool, args, timeout=timeout))
 
     async def _call_tool(self, tool: str, args: dict, *, timeout: float | None = None) -> dict:
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client
 
         request_timeout = float(timeout or self._timeout)
-        async with streamablehttp_client(self._url, headers=self._headers or None, timeout=request_timeout) as (read, write, _):
+        async with _streamable_http_connection(
+            self._url,
+            headers=self._headers or None,
+            timeout=request_timeout,
+        ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool, args)
@@ -863,7 +961,27 @@ class GraphitiMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _parse_mcp_result(result: Any) -> dict:
-        # MCP SDK returns CallToolResult with .content list of TextContent.
+        # MCP 2.x may return structuredContent/isError without text content.
+        # Prefer that lossless representation, while retaining the MCP 1.x text
+        # fallback below.
+        is_error = bool(
+            getattr(result, "isError", False)
+            or getattr(result, "is_error", False)
+        )
+        structured = getattr(result, "structuredContent", None)
+        if structured is None:
+            structured = getattr(result, "structured_content", None)
+        if structured is not None:
+            parsed = dict(structured) if isinstance(structured, dict) else {"result": structured}
+            # MCP 2 servers generated from a single object output schema may
+            # wrap the actual payload in a sole `result` field.
+            if set(parsed) == {"result"} and isinstance(parsed["result"], dict):
+                parsed = dict(parsed["result"])
+            if is_error and not parsed.get("error"):
+                parsed["error"] = str(parsed.get("message") or "MCP tool returned an error")
+            return parsed
+
+        # MCP 1.x returns CallToolResult with .content list of TextContent.
         text_parts: list[str] = []
         for item in getattr(result, "content", []) or []:
             txt = getattr(item, "text", None)
@@ -871,11 +989,18 @@ class GraphitiMemoryProvider(MemoryProvider):
                 text_parts.append(txt)
         text = "\n".join(text_parts).strip()
         if not text:
-            return {"result": None}
+            return {"error": "MCP tool returned an error"} if is_error else {"result": None}
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
+            if is_error:
+                if isinstance(parsed, dict):
+                    if not parsed.get("error"):
+                        parsed["error"] = str(parsed.get("message") or text)
+                    return parsed
+                return {"error": text, "result": parsed}
+            return parsed
         except Exception:
-            return {"text": text}
+            return {"error": text} if is_error else {"text": text}
 
 
 def register(ctx):

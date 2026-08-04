@@ -1,6 +1,7 @@
 name: graphiti
-version: 0.1.0
+version: 0.1.5
 description: Standalone Graphiti MemoryProvider and unified recall plugin for Hermes Agent.
+kind: exclusive
 hooks:
   - on_turn_start
   - on_session_end
