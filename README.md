@@ -31,7 +31,7 @@ Hermes v0.20 has three distinct compatibility/health signals:
 
 ```bash
 # Install the standalone repository through Hermes
-hermes plugins install xiaoyaner0201/hermes-graphiti-memory
+hermes plugins install xiaoyaner-home/hermes-graphiti-memory
 
 # Or copy/symlink a checkout as the active profile's user memory plugin
 # Hermes discovers user-installed memory providers under $HERMES_HOME/plugins/<name>.
